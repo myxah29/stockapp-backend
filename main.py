@@ -46,64 +46,68 @@ async def health():
 async def get_price(ticker: str, exchange: Optional[str] = None):
     """Fetch real-time price from Twelve Data."""
     if not TWELVE_API_KEY:
-        raise HTTPException(500, "TWELVE_DATA_API_KEY not configured")
+        raise HTTPException(500, "TWELVE_DATA_API_KEY not configured on server. Check Render environment variables.")
 
     params = {"symbol": ticker, "apikey": TWELVE_API_KEY}
     if exchange:
         params["exchange"] = exchange
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        # Real-time quote
-        r = await client.get("https://api.twelvedata.com/quote", params=params)
-        data = r.json()
-        if data.get("status") == "error":
-            raise HTTPException(404, data.get("message", "Ticker not found"))
-
-        # Also fetch analyst targets (Yahoo Finance via allorigins proxy — no key needed)
-        targets = {}
+    async with httpx.AsyncClient(timeout=20) as client:
+        # Real-time quote from Twelve Data
         try:
-            proxy = f"https://api.allorigins.win/get?url={httpx.URL('https://query1.finance.yahoo.com/v10/finance/quoteSummary/' + ticker + '?modules=financialData,defaultKeyStatistics,summaryDetail,price')}"
-            yr = await client.get(proxy, timeout=10)
-            yraw = json.loads(yr.json().get("contents", "{}"))
-            fin  = yraw.get("quoteSummary", {}).get("result", [{}])[0].get("financialData", {})
-            kst  = yraw.get("quoteSummary", {}).get("result", [{}])[0].get("defaultKeyStatistics", {})
-            prc  = yraw.get("quoteSummary", {}).get("result", [{}])[0].get("price", {})
-            targets = {
-                "target_low":    fin.get("targetLowPrice",  {}).get("raw"),
-                "target_mean":   fin.get("targetMeanPrice", {}).get("raw"),
-                "target_median": fin.get("targetMedianPrice",{}).get("raw"),
-                "target_high":   fin.get("targetHighPrice", {}).get("raw"),
-                "recommendation":fin.get("recommendationKey", ""),
-                "num_analysts":  fin.get("numberOfAnalystOpinions", {}).get("raw"),
-                "sector":        prc.get("sector", ""),
-                "industry":      prc.get("industry", ""),
-                "market_cap":    prc.get("marketCap", {}).get("raw"),
-                "fwd_pe":        fin.get("forwardPE", {}).get("raw") or kst.get("forwardPE", {}).get("raw"),
-                "revenue_growth":fin.get("revenueGrowth", {}).get("raw"),
-                "gross_margin":  fin.get("grossMargins", {}).get("raw"),
-            }
-        except Exception:
-            pass
+            r = await client.get("https://api.twelvedata.com/quote", params=params)
+            data = r.json()
+        except Exception as e:
+            raise HTTPException(504, f"Could not reach Twelve Data API: {str(e)}")
+
+        if data.get("status") == "error":
+            raise HTTPException(404, data.get("message", f"Ticker '{ticker}' not found. Check the symbol is correct."))
 
         price = float(data.get("close", 0) or data.get("price", 0) or 0)
         prev  = float(data.get("previous_close", price) or price)
-        low52 = float(data.get("fifty_two_week", {}).get("low",  0) or 0) or None
-        high52= float(data.get("fifty_two_week", {}).get("high", 0) or 0) or None
+        fifty_two = data.get("fifty_two_week", {}) or {}
+        low52  = float(fifty_two.get("low",  0) or 0) or None
+        high52 = float(fifty_two.get("high", 0) or 0) or None
 
-        # W1: data sufficiency check
-        key_fields = [price, low52, high52,
-                      targets.get("target_mean"), targets.get("sector"),
-                      targets.get("fwd_pe"), targets.get("market_cap")]
-        available  = sum(1 for v in key_fields if v)
+        # Try to get analyst targets from Yahoo Finance
+        targets = {}
+        try:
+            yurl = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=financialData,defaultKeyStatistics,price"
+            yr = await client.get(yurl, timeout=10,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            yraw = yr.json()
+            result = yraw.get("quoteSummary", {}).get("result", [None])[0] or {}
+            fin  = result.get("financialData", {})
+            kst  = result.get("defaultKeyStatistics", {})
+            prc  = result.get("price", {})
+            targets = {
+                "target_low":    fin.get("targetLowPrice",   {}).get("raw"),
+                "target_mean":   fin.get("targetMeanPrice",  {}).get("raw"),
+                "target_median": fin.get("targetMedianPrice",{}).get("raw"),
+                "target_high":   fin.get("targetHighPrice",  {}).get("raw"),
+                "recommendation":fin.get("recommendationKey",""),
+                "num_analysts":  fin.get("numberOfAnalystOpinions",{}).get("raw"),
+                "sector":        prc.get("sector",""),
+                "industry":      prc.get("industry",""),
+                "market_cap":    prc.get("marketCap",{}).get("raw"),
+                "fwd_pe":        (fin.get("forwardPE",{}) or kst.get("forwardPE",{})).get("raw"),
+                "revenue_growth":fin.get("revenueGrowth",{}).get("raw"),
+                "gross_margin":  fin.get("grossMargins",{}).get("raw"),
+            }
+        except Exception:
+            pass  # targets are optional — analysis will still work without them
+
+        # W1: data sufficiency
+        key_fields = [price, low52, high52, targets.get("target_mean"),
+                      targets.get("sector"), targets.get("fwd_pe"), targets.get("market_cap")]
+        available       = sum(1 for v in key_fields if v)
         sufficiency_pct = round(available / len(key_fields) * 100)
 
         # W2: conflict detection
         conflicts = []
         if price and low52 and high52:
             if price < low52 * 0.9 or price > high52 * 1.1:
-                conflicts.append(
-                    f"Live price {price} falls outside 52W range {low52}–{high52}. Data may be stale."
-                )
+                conflicts.append(f"Live price {price} falls outside 52W range {low52}–{high52}. Data may be stale.")
 
         upside = round(((targets["target_mean"] - price) / price) * 100, 1) \
                  if price and targets.get("target_mean") else None
