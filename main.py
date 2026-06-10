@@ -1,7 +1,6 @@
 import os, json, asyncio, httpx, time
 from datetime import datetime
 from typing import Optional, List
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -13,7 +12,7 @@ TWELVE_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # ── IN-MEMORY STORE ───────────────────────────────────────────────────────────
-store = {}  # { username: { ticker: { alerts: [], history: [] } } }
+store = {}
 
 def get_user(username: str):
     if username not in store:
@@ -26,7 +25,18 @@ def get_user_ticker(username: str, ticker: str):
         u[ticker] = {"alerts": [], "history": []}
     return u[ticker]
 
-# ── ALERT CHECKER (runs every 5 mins in background) ───────────────────────────
+# ── APP ───────────────────────────────────────────────────────────────────────
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── ALERT CHECKER ─────────────────────────────────────────────────────────────
 async def check_alerts_loop():
     while True:
         await asyncio.sleep(300)
@@ -55,21 +65,9 @@ async def check_alerts_loop():
                 except Exception:
                     pass
 
-# ── APP LIFESPAN ──────────────────────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+@app.on_event("startup")
+async def startup():
     asyncio.create_task(check_alerts_loop())
-    yield
-
-app = FastAPI(lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ── HEALTH ────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
