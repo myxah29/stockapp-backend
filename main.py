@@ -265,7 +265,7 @@ class AnalysisRequest(BaseModel):
     card_id:  str
     username: str
     exchange: Optional[str] = None
-    currency: Optional[str] = "USD"
+    currency: Optional[str] = None
 
 @app.post("/api/analyze/stream")
 async def analyze_stream(
@@ -410,18 +410,18 @@ STRICT RULES:
 
 # ── ALERTS ────────────────────────────────────────────────────────────────────
 class Alert(BaseModel):
-    username: str
-    ticker:   str
-    type:     str
-    price:    float
-    note:     str = ""
+    username:   str
+    ticker:     str
+    alert_type: str  # "above" or "below"
+    price:      float
+    note:       str = ""
 
 @app.post("/api/alerts")
 async def create_alert(alert: Alert):
     hist = get_user_ticker(alert.username, alert.ticker.upper())
     new_alert = {
         "id":         f"{alert.ticker}_{int(time.time())}",
-        "type":       alert.type,
+        "type":       alert.alert_type,
         "price":      alert.price,
         "note":       alert.note,
         "created_at": datetime.utcnow().isoformat(),
