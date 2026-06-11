@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime
 
 import httpx
@@ -173,6 +174,18 @@ async def get_price(ticker, exchange=None):
         # Use Finnhub company name if Twelve Data didn't give one
         company_name = data.get("name") or targets.pop("company_name", None) or ticker
 
+        # Web-sourced target fallback (clearly NOT verified) when Finnhub gave none
+        target_source = "finnhub" if targets.get("target_mean") else None
+        if not targets.get("target_mean"):
+            try:
+                results = await web_search(f"{ticker} stock analyst price target {datetime.utcnow().year}")
+                wt, wsrc = extract_web_target(results, current_price=price)
+                if wt:
+                    targets["target_mean"] = wt
+                    target_source = wsrc  # e.g. "marketwatch" — signals web-sourced, not verified
+            except Exception:
+                pass
+
         key_fields      = [price, low52, high52, targets.get("target_mean"),
                            targets.get("sector"), targets.get("fwd_pe"), targets.get("market_cap")]
         sufficiency_pct = round(sum(1 for v in key_fields if v) / len(key_fields) * 100)
@@ -204,6 +217,7 @@ async def get_price(ticker, exchange=None):
             "sufficiency_pct": sufficiency_pct,
             "conflicts":       conflicts,
             "upside_to_mean":  upside,
+            "target_source":   target_source,
             **targets,
         }
 
@@ -237,6 +251,39 @@ def format_search_block(results):
     for x in results:
         lines.append(f"- [{x.get('title','')}]({x.get('link','')}) — {x.get('snippet','')}")
     return "\n".join(lines)
+
+def extract_web_target(results, current_price=None):
+    """Scan web search snippets for an analyst price target figure.
+    Returns (value, source_domain) or (None, None). Clearly NOT verified data."""
+    if not results:
+        return None, None
+    # Patterns like "price target of $1,099", "target price: 142.50", "PT of $95"
+    patterns = [
+        r"price target[^\d]{0,15}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"target price[^\d]{0,15}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"\bPT[^\d]{0,8}\$?\s*([\d,]+(?:\.\d+)?)",
+        r"average target[^\d]{0,15}\$?\s*([\d,]+(?:\.\d+)?)",
+    ]
+    for item in results:
+        text = f"{item.get('title','')} {item.get('snippet','')}"
+        for pat in patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                val = safe_float(m.group(1).replace(",", ""))
+                if not val:
+                    continue
+                # Sanity check: target should be within a plausible band of current price
+                if current_price:
+                    if val < current_price * 0.3 or val > current_price * 4:
+                        continue  # implausible — likely picked up an unrelated number
+                domain = ""
+                link = item.get("link", "")
+                for d in CREDIBLE:
+                    if d in link:
+                        domain = d.replace(".com", "").replace(".gov", "")
+                        break
+                return val, (domain or "web")
+    return None, None
 
 # ── PROMPTS ───────────────────────────────────────────────────────────────────
 PROMPTS = {
@@ -272,7 +319,11 @@ PROMPTS = {
         f"## Current Price — from verified data, with exchange and currency\n"
         f"## Analyst Targets — table: Source | Low | Median | Mean | High | Upside to Mean\n"
         f"## Expert Valuation — bull vs bear in plain English\n"
-        f"## Best Entry Price — specific price or range with reasoning\n"
+        f"## Best Entry Price\n"
+        f"Give your reasoning in a sentence or two (support levels, margin of safety), "
+        f"THEN on its very own final line write exactly this format with no other text:\n"
+        f"`ENTRY: <number or range>` — for example `ENTRY: 800-850` or `ENTRY: 142.50`\n"
+        f"Use the same currency as the current price. Do not put any other number on the ENTRY line.\n"
         f"## Key Risk — one sentence on main downside scenario\n\n"
         f"End: **Upside Score: X/10**, ### Why this score, ## TL;DR (3 sentences)."
     ),
