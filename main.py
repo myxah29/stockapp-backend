@@ -9,9 +9,10 @@ from fastapi.responses import StreamingResponse
 from fastapi.requests import Request
 
 # ── ENV VARS ──────────────────────────────────────────────────────────────────
-GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
-TWELVE_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
+TWELVE_API_KEY  = os.environ.get("TWELVE_DATA_API_KEY", "")
+SERPER_API_KEY  = os.environ.get("SERPER_API_KEY", "")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 
 # ── STORE ─────────────────────────────────────────────────────────────────────
 store = {}
@@ -44,15 +45,89 @@ async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
 # ── HELPER ────────────────────────────────────────────────────────────────────
-def safe_raw(d, key):
-    v = d.get(key)
-    return v.get("raw") if isinstance(v, dict) else v
-
 def safe_float(v, default=0.0):
     try:
         return float(v)
     except (TypeError, ValueError):
         return default
+
+# ── FINNHUB FUNDAMENTALS + ANALYST TARGETS ───────────────────────────────────
+async def fetch_finnhub(client, ticker):
+    """Fetch analyst targets, recommendation, and company profile from Finnhub.
+    Returns a dict of fields; missing fields are simply absent."""
+    out = {}
+    if not FINNHUB_API_KEY:
+        return out
+    tok = FINNHUB_API_KEY
+
+    # 1) Price target (low/mean/median/high)
+    try:
+        r = await client.get(
+            "https://finnhub.io/api/v1/stock/price-target",
+            params={"symbol": ticker, "token": tok}, timeout=10,
+        )
+        pt = r.json() or {}
+        out["target_low"]    = pt.get("targetLow") or None
+        out["target_mean"]   = pt.get("targetMean") or None
+        out["target_median"] = pt.get("targetMedian") or None
+        out["target_high"]   = pt.get("targetHigh") or None
+    except Exception:
+        pass
+
+    # 2) Analyst recommendation consensus (most recent period)
+    try:
+        r = await client.get(
+            "https://finnhub.io/api/v1/stock/recommendation",
+            params={"symbol": ticker, "token": tok}, timeout=10,
+        )
+        recs = r.json() or []
+        if isinstance(recs, list) and recs:
+            latest = recs[0]
+            buy  = (latest.get("strongBuy", 0) or 0) + (latest.get("buy", 0) or 0)
+            hold = latest.get("hold", 0) or 0
+            sell = (latest.get("strongSell", 0) or 0) + (latest.get("sell", 0) or 0)
+            total = buy + hold + sell
+            out["num_analysts"] = total or None
+            if total:
+                if buy / total >= 0.6:
+                    out["recommendation"] = "buy"
+                elif sell / total >= 0.4:
+                    out["recommendation"] = "sell"
+                else:
+                    out["recommendation"] = "hold"
+    except Exception:
+        pass
+
+    # 3) Company profile (sector/industry, market cap)
+    try:
+        r = await client.get(
+            "https://finnhub.io/api/v1/stock/profile2",
+            params={"symbol": ticker, "token": tok}, timeout=10,
+        )
+        prof = r.json() or {}
+        out["industry"]   = prof.get("finnhubIndustry") or ""
+        out["sector"]     = prof.get("finnhubIndustry") or ""  # Finnhub gives industry, use as sector proxy
+        mc = prof.get("marketCapitalization")  # in millions
+        out["market_cap"] = (mc * 1_000_000) if mc else None
+        if prof.get("name"):
+            out["company_name"] = prof.get("name")
+    except Exception:
+        pass
+
+    # 4) Basic financials (forward P/E, margins, growth)
+    try:
+        r = await client.get(
+            "https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": ticker, "metric": "all", "token": tok}, timeout=10,
+        )
+        m = (r.json() or {}).get("metric", {}) or {}
+        out["fwd_pe"]         = m.get("peTTM") or m.get("peBasicExclExtraTTM") or None
+        out["gross_margin"]   = (m.get("grossMarginTTM") / 100) if m.get("grossMarginTTM") else None
+        out["revenue_growth"] = (m.get("revenueGrowthTTMYoy") / 100) if m.get("revenueGrowthTTMYoy") else None
+    except Exception:
+        pass
+
+    return out
 
 # ── LIVE PRICE ────────────────────────────────────────────────────────────────
 @app.get("/api/price/{ticker}")
@@ -80,35 +155,23 @@ async def get_price(ticker, exchange=None):
         low52  = safe_float(fw.get("low")) or None
         high52 = safe_float(fw.get("high")) or None
 
-        targets = {}
+        # Fundamentals + analyst targets from Finnhub
+        targets = {
+            "target_low": None, "target_mean": None, "target_median": None,
+            "target_high": None, "recommendation": "", "num_analysts": None,
+            "sector": "", "industry": "", "market_cap": None,
+            "fwd_pe": None, "revenue_growth": None, "gross_margin": None,
+        }
         try:
-            yurl = (
-                "https://query1.finance.yahoo.com/v10/finance/quoteSummary/"
-                f"{ticker}?modules=financialData,defaultKeyStatistics,price"
-            )
-            yr      = await client.get(yurl, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            yd      = yr.json()
-            results = ((yd.get("quoteSummary") or {}).get("result") or [{}])
-            res     = results[0] if results else {}
-            fin     = res.get("financialData") or {}
-            kst     = res.get("defaultKeyStatistics") or {}
-            prc     = res.get("price") or {}
-            targets = {
-                "target_low":     safe_raw(fin, "targetLowPrice"),
-                "target_mean":    safe_raw(fin, "targetMeanPrice"),
-                "target_median":  safe_raw(fin, "targetMedianPrice"),
-                "target_high":    safe_raw(fin, "targetHighPrice"),
-                "recommendation": fin.get("recommendationKey") or "",
-                "num_analysts":   safe_raw(fin, "numberOfAnalystOpinions"),
-                "sector":         prc.get("sector") or "",
-                "industry":       prc.get("industry") or "",
-                "market_cap":     safe_raw(prc, "marketCap"),
-                "fwd_pe":         safe_raw(fin, "forwardPE") or safe_raw(kst, "forwardPE"),
-                "revenue_growth": safe_raw(fin, "revenueGrowth"),
-                "gross_margin":   safe_raw(fin, "grossMargins"),
-            }
+            fh = await fetch_finnhub(client, ticker.upper())
+            for k, v in fh.items():
+                if v:
+                    targets[k] = v
         except Exception:
             pass
+
+        # Use Finnhub company name if Twelve Data didn't give one
+        company_name = data.get("name") or targets.pop("company_name", None) or ticker
 
         key_fields      = [price, low52, high52, targets.get("target_mean"),
                            targets.get("sector"), targets.get("fwd_pe"), targets.get("market_cap")]
@@ -136,7 +199,7 @@ async def get_price(ticker, exchange=None):
             "pct_of_range":    pct_of_range,
             "volume":          data.get("volume"),
             "avg_volume":      data.get("average_volume"),
-            "name":            data.get("name") or ticker,
+            "name":            company_name,
             "fetched_at":      datetime.utcnow().isoformat(),
             "sufficiency_pct": sufficiency_pct,
             "conflicts":       conflicts,
@@ -240,8 +303,9 @@ async def analyze_stream(request: Request):
     if card_id not in PROMPTS:
         raise HTTPException(400, f"Unknown card_id: {card_id}")
 
-    # 1 — Live price
+    # 1 — Live price + fundamentals
     price_data = {}
+    fundamentals = {}
     try:
         params = {"symbol": ticker, "apikey": TWELVE_API_KEY}
         if exchange:
@@ -251,6 +315,11 @@ async def analyze_stream(request: Request):
             pd = r.json()
             if pd.get("status") != "error":
                 price_data = pd
+            # Fetch Finnhub fundamentals + analyst targets in same client
+            try:
+                fundamentals = await fetch_finnhub(client, ticker)
+            except Exception:
+                fundamentals = {}
     except Exception:
         pass
 
@@ -267,6 +336,15 @@ async def analyze_stream(request: Request):
     cur = price_data.get("currency") or currency
     fw  = price_data.get("fifty_two_week") or {}
 
+    def fval(v):
+        return v if v not in (None, "", 0) else "N/A — not in verified data"
+
+    target_mean = fundamentals.get("target_mean")
+    upside_str = (
+        f"{round(((target_mean - price) / price) * 100, 1)}%"
+        if price and target_mean else "N/A"
+    )
+
     live_block = "\n".join([
         f"## VERIFIED LIVE DATA FOR {ticker}",
         f"Fetched: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
@@ -276,7 +354,20 @@ async def analyze_stream(request: Request):
         f"52W Low: {fw.get('low') or 'N/A'} | 52W High: {fw.get('high') or 'N/A'}",
         f"Change: {price_data.get('change') or 'N/A'} ({price_data.get('percent_change') or 'N/A'}%)",
         f"Volume: {price_data.get('volume') or 'N/A'}",
-        f"Company: {price_data.get('name') or ticker}",
+        f"Company: {price_data.get('name') or fundamentals.get('company_name') or ticker}",
+        f"Sector/Industry: {fval(fundamentals.get('sector') or fundamentals.get('industry'))}",
+        f"Market Cap: {fval(fundamentals.get('market_cap'))}",
+        f"Forward P/E: {fval(fundamentals.get('fwd_pe'))}",
+        f"Gross Margin: {fval(fundamentals.get('gross_margin'))}",
+        f"Revenue Growth YoY: {fval(fundamentals.get('revenue_growth'))}",
+        "",
+        "### ANALYST TARGETS (from Finnhub)",
+        f"Target Low: {fval(fundamentals.get('target_low'))}",
+        f"Target Mean: {fval(fundamentals.get('target_mean'))}",
+        f"Target Median: {fval(fundamentals.get('target_median'))}",
+        f"Target High: {fval(fundamentals.get('target_high'))}",
+        f"Upside to Mean Target: {upside_str}",
+        f"Analyst Consensus: {fval(fundamentals.get('recommendation'))} ({fundamentals.get('num_analysts') or '?'} analysts)",
         "",
         "RULES: These figures are ground truth. Do not modify or replace them.",
         'Any missing figure must be labelled "N/A — not in verified data".',
