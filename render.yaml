@@ -2,9 +2,12 @@ services:
   - type: web
     name: stockapp-backend
     runtime: python
-    buildCommand: pip install --upgrade pip && pip install --only-binary=:all: pydantic-core==2.18.2 pydantic==2.7.1 && pip install -r requirements.txt
+    pythonVersion: "3.11.9"
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: TWELVE_DATA_API_KEY
         sync: false
       - key: SERPER_API_KEY
